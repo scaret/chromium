@@ -1,98 +1,64 @@
-name: Mirror to Private
+name: Import to Private (server-side)
 
 on:
   workflow_dispatch:
     inputs:
-      source_repo:
-        description: "Source repo (owner/name or full https URL)"
-        required: false
+      source_url:
+        description: "Source git URL"
+        required: true
         default: "https://github.com/scaret/chromium.git"
       target_owner:
-        description: "Target owner (user or org)"
-        required: false
+        description: "Target owner"
+        required: true
         default: "scaret"
       target_repo:
         description: "Target repo name"
-        required: false
+        required: true
         default: "chromium-private"
-      make_private:
-        description: "Ensure target repo is private if creating"
-        required: false
-        default: "true"
 
 jobs:
-  mirror:
+  import:
     runs-on: ubuntu-latest
-    timeout-minutes: 360   # 大仓库推送可能较久（<=6小时/Job）
     steps:
-      - name: Show inputs
-        run: |
-          echo "SOURCE_REPO=${{ github.event.inputs.source_repo }}"
-          echo "TARGET_OWNER=${{ github.event.inputs.target_owner }}"
-          echo "TARGET_REPO=${{ github.event.inputs.target_repo }}"
-          echo "MAKE_PRIVATE=${{ github.event.inputs.make_private }}"
+      - name: Check secret
+        run: 'test -n "${{ secrets.TARGET_TOKEN }}" || (echo "Missing TARGET_TOKEN secret"; exit 1)'
 
-      - name: Check TOKEN
-        run: |
-          if [ -z "${{ secrets.TARGET_TOKEN }}" ]; then
-            echo "Missing secret TARGET_TOKEN"; exit 1
-          fi
-
-      - name: Install Git (ensure)
-        run: sudo apt-get update && sudo apt-get install -y git
-
-      - name: Clone source as bare mirror
-        run: |
-          SRC="${{ github.event.inputs.source_repo }}"
-          git clone --mirror "$SRC" repo.git
-          cd repo.git
-          git remote -v
-
-      - name: Ensure target repo exists (create if 404)
+      - name: Ensure target repo exists (create private if missing)
         env:
-          TARGET_TOKEN: ${{ secrets.TARGET_TOKEN }}
+          TOKEN: ${{ secrets.TARGET_TOKEN }}
         run: |
-          set -e
+          set -euo pipefail
           OWNER="${{ github.event.inputs.target_owner }}"
           REPO="${{ github.event.inputs.target_repo }}"
-          PRIVATE="${{ github.event.inputs.make_private }}"
-          AUTH="Authorization: token ${TARGET_TOKEN}"
+          AUTH="Authorization: token ${TOKEN}"
           ACCEPT="Accept: application/vnd.github+json"
 
-          STATUS=$(curl -s -o /dev/null -w "%{http_code}" \
-            -H "$AUTH" -H "$ACCEPT" \
+          code=$(curl -s -o /dev/null -w "%{http_code}" -H "$AUTH" -H "$ACCEPT" \
             "https://api.github.com/repos/${OWNER}/${REPO}")
-
-          if [ "$STATUS" = "404" ]; then
-            # 创建到用户名下；若为组织，请改用 /orgs/{org}/repos
-            DATA=$(jq -n --arg name "$REPO" --argjson private $( [ "$PRIVATE" = "true" ] && echo true || echo false ) \
-              '{name:$name, private:$private}')
-            CREATE_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST \
-              -H "$AUTH" -H "$ACCEPT" \
-              https://api.github.com/user/repos \
-              -d "$DATA")
-            if [ "$CREATE_STATUS" != "201" ]; then
-              echo "Create repo failed with HTTP $CREATE_STATUS"; exit 1
-            fi
-            echo "Created ${OWNER}/${REPO}"
+          if [ "$code" = "404" ]; then
+            body='{"name":"'"$REPO"'","private":true}'
+            # 若要建到组织：改用 https://api.github.com/orgs/<org>/repos
+            code=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "$AUTH" -H "$ACCEPT" \
+              https://api.github.com/user/repos -d "$body")
+            [ "$code" = "201" ] || { echo "Create repo failed: HTTP $code"; exit 1; }
+            echo "Created ${OWNER}/${REPO} (private)"
           else
-            echo "Target repo exists (HTTP $STATUS)"
+            echo "Target exists (HTTP $code)"
           fi
 
-      - name: Push mirror to target
+      - name: Start server-side import
         env:
-          TARGET_TOKEN: ${{ secrets.TARGET_TOKEN }}
+          TOKEN: ${{ secrets.TARGET_TOKEN }}
         run: |
-          set -e
+          set -euo pipefail
           OWNER="${{ github.event.inputs.target_owner }}"
           REPO="${{ github.event.inputs.target_repo }}"
+          SRC="${{ github.event.inputs.source_url }}"
+          AUTH="Authorization: token ${TOKEN}"
+          ACCEPT="Accept: application/vnd.github+json"
+          body='{"vcs":"git","vcs_url":"'"$SRC"'"}'
 
-          cd repo.git
-          git remote add target "https://${TARGET_TOKEN}@github.com/${OWNER}/${REPO}.git"
-          # 推送所有 refs（分支、标签、notes），与源保持一致
-          git push --mirror target
-          echo "Mirror push completed."
-
-      - name: Harden default permissions (optional)
-        if: always()
-        run: echo "Done."
+          code=$(curl -s -o /dev/null -w "%{http_code}" -X PUT -H "$AUTH" -H "$ACCEPT" \
+            "https://api.github.com/repos/${OWNER}/${REPO}/import" -d "$body")
+          [ "$code" = "201" ] || [ "$code" = "202" ] || { echo "Import start failed: HTTP $code"; exit 1; }
+          echo "Import started. Check: https://github.com/${OWNER}/${REPO}/import"
